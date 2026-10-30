@@ -38,36 +38,54 @@ sudo ./rebirth
 ```
 
 #### Command Options:
+* `-m, --menu`: Force interactive checklist menu (runs automatically when launched in terminal).
+* `--no-menu`: Skip interactive menu and use CLI flags or default settings.
+* `-p, --purge-snap`: Purge all snap packages, remove snapd, and block snapd via APT pinning.
+* `--no-purge-snap`: Keep snapd and snap packages.
+* `--flatpak`: Install Flatpak and configure Flathub repository (recommended alternative).
+* `--dev-tools`: Install developer essentials (curl, git, build-essential, zsh, htop).
+* `--no-devel`: Do NOT switch to devel series (run only selected tweaks like Snap removal).
 * `-d, --dry-run`: Test pre-flight checks and view proposed changes without modifying files.
 * `-f, --force`: Force tracking devel series even on stable LTS/interim releases.
 * `-s, --skip-desktop-check`: Skip checking for desktop packages (ideal for Server or Minimal setups).
-* `-y, --yes`: Automatic yes to prompts (unattended mode).
+* `-y, --yes`: Automatic yes to prompts (unattended mode, skips interactive menu).
 * `-h, --help`: Display usage help.
 
-### 3. Example Output
+### 3. Interactive Menu Interface
+
+When you run `sudo ./rebirth`, you get an interactive checklist menu. Use your keyboard to customize exactly what you want:
 
 ```text
-Rolling Rebirth 🔄
-  [+] INFO: lsb_release detected.
-  [+] INFO: Ubuntu detected (noble).
-  [+] INFO: Ubuntu 24.04 LTS (development branch) detected.
-  [+] INFO: Detected ubuntu-desktop.
-  [+] INFO: No third-party PPAs detected, this is good.
-  [+] INFO: All pre-flight checks passed.
-Are you sure you want to start tracking the devel series? [y/N]
+  ==[ Configuration Checklist ]==
+  Use [↑/↓] or [j/k] to navigate, [Space] to toggle, [Enter] to confirm:
+
+  ➔ [✔] Track Ubuntu 'devel' series (Rolling Release)
+    [✔] Purge Snap completely and block snapd (De-Snap)
+    [ ] Install Flatpak with Flathub repository
+    [ ] Disable active third-party PPAs & external repositories
+    [ ] Install Dev Essentials (curl, git, build-essential, zsh, htop)
+    [✔] Clean up obsolete packages & APT cache
 ```
 
-Once confirmed, `rebirth` updates your APT sources (automatically detecting whether to update modern deb822 `ubuntu.sources` or traditional `sources.list`), backs up previous configs, cleans up obsolete caches, and performs a full `dist-upgrade`.
+* Navigate with **`↑` / `↓`** (or **`k` / `j`**)
+* Toggle selections on/off with **`[Space]`**
+* Press **`[Enter]`** to confirm and run!
+
+Once confirmed, `rebirth` executes your chosen tasks in sequence, backs up your configurations, updates sources (supporting modern deb822 `ubuntu.sources`), and sets up your system cleanly.
 
 ---
 
 ## 🛠️ Roadmap & Enhancements
 
+* [x] **Interactive Spacebar Checklist Menu:** Navigate with arrows and toggle choices with Spacebar before execution.
 * [x] **Modern APT Support (deb822):** Full compatibility with `/etc/apt/sources.list.d/ubuntu.sources` on Ubuntu 24.04 Noble Numbat and newer.
+* [x] **Complete Snap Purge (De-Snap):** Fully remove snap packages, services, directories, and block snapd from reinstalling (`-p, --purge-snap`).
+* [x] **Flatpak & Flathub Integration:** Clean alternative application store support (`--flatpak`).
+* [x] **Developer Essentials Pack:** Quick installation of curl, git, build-essential, zsh, and htop (`--dev-tools`).
+* [x] **Modular Devel Toggle:** Ability to deselect tracking devel to use Rebirth purely as a system tweaker/de-snapper (`--no-devel`).
 * [x] **Server & Minimal Mode:** Option to run without requiring a desktop environment package installed (`--skip-desktop-check`).
 * [x] **Dry-run Mode:** Safe simulation before applying changes (`--dry-run`).
 * [ ] **Safety & Snapshot Integration:** Automatic Btrfs or Timeshift snapshot before triggering `dist-upgrade`.
-* [ ] **Custom Packages & Dotfiles:** Easy hooks to auto-install preferred developer tools and configs.
 
 ---
 

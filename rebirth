@@ -3,15 +3,22 @@
 function usage () {
   echo
   echo "Rolling Rebirth 🔄"
-  echo "Convert Ubuntu into a rolling release tracking the devel series."
+  echo "Convert Ubuntu into a rolling release tracking the devel series, with modular tweaks."
   echo
   echo "Usage:"
   echo "  sudo $0 [OPTIONS]"
   echo
   echo "Options:"
+  echo "  -m, --menu                Force interactive checklist menu (default in terminal)"
+  echo "      --no-menu             Skip interactive menu and use command line flags"
+  echo "  -p, --purge-snap          Purge all snap packages, remove snapd, and pin APT against snapd"
+  echo "      --no-purge-snap       Keep snapd and snap packages"
+  echo "      --flatpak             Install Flatpak and configure Flathub repository"
+  echo "      --dev-tools           Install developer essentials (curl, git, build-essential, zsh, htop)"
+  echo "      --no-devel            Do not switch to devel series (run only selected tweaks/snap purge)"
   echo "  -f, --force               Force tracking devel series even on stable LTS/interim releases"
   echo "  -s, --skip-desktop-check  Skip checking for desktop package (e.g. for Server/Minimal)"
-  echo "  -y, --yes                 Automatic yes to prompts (unattended mode)"
+  echo "  -y, --yes                 Automatic yes to all prompts (unattended mode, skips menu)"
   echo "  -d, --dry-run             Perform pre-flight checks and display plan without making changes"
   echo "  -h, --help                Show this help message"
   echo
@@ -19,10 +26,7 @@ function usage () {
 
 function fancy_message() {
     # $1 = type , $2 = message
-    # Message types
-    # info
-    # warn
-    # error
+    # Message types: info, warn, error
     if [ -z "${1}" ] || [ -z "${2}" ]; then
       return 2
     fi
@@ -48,10 +52,224 @@ function grep_active_deb822_ppas ()
   grep "$@" -e '^\s*Suites:' -R --include='*.sources' --exclude='ubuntu.sources*' --exclude='*.orig' /etc/apt/sources.list.d 2>/dev/null
 }
 
+function purge_snap_packages () {
+  fancy_message info "Purging all Snap packages and snapd..."
+
+  if which snap 1>/dev/null 2>&1; then
+    # Phase 1: Normal desktop applications
+    for s in $(snap list 2>/dev/null | awk 'NR>1 {print $1}'); do
+      case "${s}" in
+        core*|bare|snapd|base*|gtk-common-themes*|gnome-*) ;;
+        *)
+          fancy_message info "Removing snap app: ${s}"
+          snap remove --purge "${s}" 2>/dev/null || true
+          ;;
+      esac
+    done
+
+    # Phase 2: Themes and desktop runtimes
+    for s in $(snap list 2>/dev/null | awk 'NR>1 {print $1}'); do
+      case "${s}" in
+        core*|bare|snapd) ;;
+        *)
+          fancy_message info "Removing snap runtime: ${s}"
+          snap remove --purge "${s}" 2>/dev/null || true
+          ;;
+      esac
+    done
+
+    # Phase 3: Core runtimes and snapd
+    for s in $(snap list 2>/dev/null | awk 'NR>1 {print $1}'); do
+      fancy_message info "Removing core snap: ${s}"
+      snap remove --purge "${s}" 2>/dev/null || true
+    done
+  fi
+
+  # Stop and disable snap services
+  fancy_message info "Stopping snapd services..."
+  systemctl stop snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
+  systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
+
+  # Purge snapd package via apt
+  fancy_message info "Purging snapd Debian package..."
+  apt-get purge -y snapd 2>/dev/null || true
+  apt-get autoremove --purge -y 2>/dev/null || true
+
+  # Remove snap directories
+  fancy_message info "Cleaning up leftover snap directories..."
+  rm -rf /var/cache/snapd /var/snap /snap /var/lib/snapd /root/snap /etc/systemd/system/snap* 2>/dev/null || true
+  for user_home in /home/*; do
+    if [ -d "${user_home}/snap" ]; then
+      rm -rf "${user_home}/snap" 2>/dev/null || true
+    fi
+  done
+
+  # Block snapd from being reinstalled (APT pinning)
+  fancy_message info "Pinning APT preferences to block snapd from being reinstalled..."
+  cat << 'EOF' > /etc/apt/preferences.d/nosnap.pref
+# Created by Rolling Rebirth
+# Prevent snapd from being reinstalled automatically by Ubuntu/APT
+Package: snapd
+Pin: release *
+Pin-Priority: -10
+EOF
+
+  fancy_message info "Snap has been completely purged and blocked."
+}
+
+function install_flatpak_support () {
+  fancy_message info "Installing Flatpak..."
+  apt-get update 2>/dev/null || true
+  apt-get install -y flatpak 2>/dev/null || true
+
+  if dpkg -s gnome-software 1>/dev/null 2>&1; then
+    apt-get install -y gnome-software-plugin-flatpak 2>/dev/null || true
+  fi
+
+  fancy_message info "Adding Flathub repository..."
+  flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+  fancy_message info "Flatpak and Flathub installed successfully."
+}
+
+function install_dev_tools () {
+  fancy_message info "Installing Dev Essentials (curl, git, build-essential, zsh, htop)..."
+  apt-get update 2>/dev/null || true
+  apt-get install -y curl git build-essential zsh htop 2>/dev/null || true
+  fancy_message info "Dev Essentials installed successfully."
+}
+
+function interactive_checklist () {
+  local -a options=(
+    "Track Ubuntu 'devel' series (Rolling Release)"
+    "Purge Snap completely and block snapd (De-Snap)"
+    "Install Flatpak with Flathub repository"
+    "Disable active third-party PPAs & external repositories"
+    "Install Dev Essentials (curl, git, build-essential, zsh, htop)"
+    "Clean up obsolete packages & APT cache"
+  )
+
+  # Default selection: Devel (1), De-Snap (1), Cleanup (1)
+  local -a selected=(1 1 0 0 0 1)
+
+  # Respect CLI overrides if provided
+  [ "${PURGE_SNAP_CLI}" = "true" ] && selected[1]=1
+  [ "${PURGE_SNAP_CLI}" = "false" ] && selected[1]=0
+  [ "${INSTALL_FLATPAK_CLI}" = "true" ] && selected[2]=1
+  [ "${INSTALL_FLATPAK_CLI}" = "false" ] && selected[2]=0
+  [ "${DEV_TOOLS_CLI}" = "true" ] && selected[4]=1
+  [ "${TRACK_DEVEL_CLI}" = "false" ] && selected[0]=0
+
+  local cur=0
+  local total=${#options[@]}
+
+  ESC=$(printf "\033")
+  UP="${ESC}[A"
+  DOWN="${ESC}[B"
+
+  # Hide cursor and ensure cleanup on exit
+  printf "\033[?25l"
+  stty_state=$(stty -g 2>/dev/null)
+  restore_cursor() {
+    printf "\033[?25h"
+    [ -n "${stty_state}" ] && stty "${stty_state}" 2>/dev/null
+  }
+  trap restore_cursor EXIT INT TERM
+
+  print_menu() {
+    for i in "${!options[@]}"; do
+      local mark=" "
+      local color_mark="\033[1;30m"
+      if [ "${selected[$i]}" -eq 1 ]; then
+        mark="✔"
+        color_mark="\033[1;32m"
+      fi
+
+      local prefix="    "
+      local color_text="\033[0m"
+      if [ "$i" -eq "$cur" ]; then
+        prefix="  \033[1;36m➔ \033[0m"
+        color_text="\033[1;37m"
+      fi
+
+      printf "\r${prefix}[${color_mark}%s\033[0m] ${color_text}%s\033[0m\033[K\n" "$mark" "${options[$i]}"
+    done
+  }
+
+  echo
+  printf "  \033[1;35m==[\033[0m \033[1;37mConfiguration Checklist\033[0m \033[1;35m]==\033[0m\n"
+  printf "  \033[0;33mUse [↑/↓] or [j/k] to navigate, [Space] to toggle, [Enter] to confirm:\033[0m\n\n"
+  print_menu
+
+  while true; do
+    IFS= read -rsn1 key
+    if [ "$key" = "$ESC" ]; then
+      read -rsn2 -t 0.5 rest
+      key+="$rest"
+    fi
+
+    case "$key" in
+      "$UP"|[kK])
+        if [ "$cur" -gt 0 ]; then
+          cur=$((cur - 1))
+        else
+          cur=$((total - 1))
+        fi
+        ;;
+      "$DOWN"|[jJ])
+        if [ "$cur" -lt $((total - 1)) ]; then
+          cur=$((cur + 1))
+        else
+          cur=0
+        fi
+        ;;
+      " ")
+        if [ "${selected[$cur]}" -eq 1 ]; then
+          selected[$cur]=0
+        else
+          selected[$cur]=1
+        fi
+        ;;
+      "")
+        break
+        ;;
+    esac
+
+    printf "\033[%dA" "$total"
+    print_menu
+  done
+
+  restore_cursor
+  trap - EXIT INT TERM
+  echo
+
+  # Assign results
+  [ "${selected[0]}" -eq 1 ] && TRACK_DEVEL=true || TRACK_DEVEL=false
+  [ "${selected[1]}" -eq 1 ] && PURGE_SNAP=true || PURGE_SNAP=false
+  [ "${selected[2]}" -eq 1 ] && INSTALL_FLATPAK=true || INSTALL_FLATPAK=false
+  [ "${selected[3]}" -eq 1 ] && DISABLE_PPAS=true || DISABLE_PPAS=false
+  [ "${selected[4]}" -eq 1 ] && INSTALL_DEV_TOOLS=true || INSTALL_DEV_TOOLS=false
+  [ "${selected[5]}" -eq 1 ] && CLEAN_SYSTEM=true || CLEAN_SYSTEM=false
+
+  fancy_message info "Confirmed selections:"
+  [ "${TRACK_DEVEL}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Track Ubuntu 'devel' series"
+  [ "${PURGE_SNAP}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Purge Snap completely and block snapd"
+  [ "${INSTALL_FLATPAK}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Install Flatpak & configure Flathub"
+  [ "${DISABLE_PPAS}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Disable third-party PPAs"
+  [ "${INSTALL_DEV_TOOLS}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Install Dev Essentials"
+  [ "${CLEAN_SYSTEM}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Full system cleanup"
+  echo
+}
+
 FORCE=false
 SKIP_DESKTOP=false
 ASSUME_YES=false
 DRY_RUN=false
+FORCE_MENU=false
+NO_MENU=false
+PURGE_SNAP_CLI=""
+INSTALL_FLATPAK_CLI=""
+DEV_TOOLS_CLI=""
+TRACK_DEVEL_CLI=""
 
 # Take command line arguments
 while [ $# -gt 0 ]; do
@@ -59,6 +277,27 @@ while [ $# -gt 0 ]; do
     -h|--h|-help|--help)
       usage
       exit 0;;
+    -m|--menu)
+      FORCE_MENU=true
+      shift;;
+    --no-menu)
+      NO_MENU=true
+      shift;;
+    -p|--purge-snap)
+      PURGE_SNAP_CLI=true
+      shift;;
+    --no-purge-snap)
+      PURGE_SNAP_CLI=false
+      shift;;
+    --flatpak|--install-flatpak)
+      INSTALL_FLATPAK_CLI=true
+      shift;;
+    --dev-tools)
+      DEV_TOOLS_CLI=true
+      shift;;
+    --no-devel)
+      TRACK_DEVEL_CLI=false
+      shift;;
     -f|--force)
       FORCE=true
       shift;;
@@ -96,19 +335,6 @@ fi
 DEB822_FILE="/etc/apt/sources.list.d/ubuntu.sources"
 TRADITIONAL_FILE="/etc/apt/sources.list"
 
-already_tracking=false
-if [ -f "${DEB822_FILE}" ] && grep -E -q '^\s*Suites:.*\bdevel\b' "${DEB822_FILE}"; then
-  already_tracking=true
-fi
-if [ -f "${TRADITIONAL_FILE}" ] && grep -E -q '^\s*deb\s+.*\bdevel\b' "${TRADITIONAL_FILE}"; then
-  already_tracking=true
-fi
-
-if [ "${already_tracking}" = "true" ]; then
-  fancy_message error "Already tracking the devel series. Nothing to do."
-  exit 1
-fi
-
 OS_CODENAME=$(lsb_release --codename --short 2>/dev/null)
 OS_ID=$(lsb_release --id --short 2>/dev/null)
 if [ "${OS_ID}" == "Ubuntu" ]; then
@@ -119,69 +345,69 @@ else
 fi
 
 OS_DESCRIPTION=$(lsb_release --description --short 2>/dev/null)
-if [[ "${OS_DESCRIPTION}" == *"development branch"* ]]; then
-  fancy_message info "${OS_DESCRIPTION} detected."
-elif [ "${FORCE}" = "true" ]; then
-  fancy_message warn "${OS_DESCRIPTION} detected. Forcing switch to devel series as requested (--force)."
-elif [[ "${OS_DESCRIPTION}" == *"LTS"* ]]; then
-  fancy_message error "${OS_DESCRIPTION} detected. Switching directly from a stable LTS release to devel is not recommended. Use --force to proceed anyway."
-  exit 1
-else
-  fancy_message error "${OS_DESCRIPTION} detected. Switching directly from an interim release to devel is not recommended. Use --force to proceed anyway."
-  exit 1
+
+# Decide whether to show interactive checklist
+SHOW_INTERACTIVE=false
+if [ "${ASSUME_YES}" = "true" ] || [ "${NO_MENU}" = "true" ]; then
+  SHOW_INTERACTIVE=false
+elif [ "${FORCE_MENU}" = "true" ] || [ -t 0 ]; then
+  SHOW_INTERACTIVE=true
 fi
 
-if [ "${SKIP_DESKTOP}" = "true" ]; then
-  fancy_message info "Skipping desktop package check (--skip-desktop-check)."
+if [ "${SHOW_INTERACTIVE}" = "true" ]; then
+  interactive_checklist
 else
-  META="$(
-    dpkg-query -Wf '${Status}\t${Package}\n' \
-      {{,k,l,x}ubuntu,ubuntu{-budgie,-mate,kylin,studio,unity,-cinnamon}}-desktop ubuntu-wsl \
-      2>/dev/null |
-    awk -F '\t' '($1 == "install ok installed") { print $2; exit; }')"
-  if [ -n "${META}" ]; then
-    fancy_message info "Detected ${META}."
+  TRACK_DEVEL=${TRACK_DEVEL_CLI:-true}
+  PURGE_SNAP=${PURGE_SNAP_CLI:-true}
+  INSTALL_FLATPAK=${INSTALL_FLATPAK_CLI:-false}
+  INSTALL_DEV_TOOLS=${DEV_TOOLS_CLI:-false}
+  DISABLE_PPAS=false
+  CLEAN_SYSTEM=true
+fi
+
+# Pre-flight check for Track Devel if selected
+if [ "${TRACK_DEVEL}" = "true" ]; then
+  already_tracking=false
+  if [ -f "${DEB822_FILE}" ] && grep -E -q '^\s*Suites:.*\bdevel\b' "${DEB822_FILE}"; then
+    already_tracking=true
+  fi
+  if [ -f "${TRADITIONAL_FILE}" ] && grep -E -q '^\s*deb\s+.*\bdevel\b' "${TRADITIONAL_FILE}"; then
+    already_tracking=true
+  fi
+
+  if [ "${already_tracking}" = "true" ]; then
+    fancy_message warn "Already tracking the devel series. Skipping source modification."
+    TRACK_DEVEL=false
+  fi
+
+  if [[ "${OS_DESCRIPTION}" == *"development branch"* ]]; then
+    fancy_message info "${OS_DESCRIPTION} detected."
+  elif [ "${FORCE}" = "true" ]; then
+    fancy_message warn "${OS_DESCRIPTION} detected. Forcing switch to devel series as requested (--force)."
+  elif [[ "${OS_DESCRIPTION}" == *"LTS"* ]]; then
+    fancy_message error "${OS_DESCRIPTION} detected. Switching directly from a stable LTS release to devel is not recommended. Use --force to proceed anyway."
+    exit 1
   else
-    fancy_message error "No installed desktop packages were detected. Use --skip-desktop-check if running on Server/Minimal."
+    fancy_message error "${OS_DESCRIPTION} detected. Switching directly from an interim release to devel is not recommended. Use --force to proceed anyway."
     exit 1
   fi
-fi
 
-has_ppas=false
-if grep_active_ppas -q || grep_active_deb822_ppas -q; then
-  has_ppas=true
-fi
-
-if [ "${has_ppas}" = "true" ]; then
-  fancy_message warn "PPAs or third-party repositories detected. You are responsible for PPA migrations in the future."
-  if [ "${ASSUME_YES}" = "true" ]; then
-    DISABLE_PPA="y"
-  elif [ "${DRY_RUN}" = "true" ]; then
-    DISABLE_PPA="n"
+  if [ "${SKIP_DESKTOP}" = "true" ]; then
+    fancy_message info "Skipping desktop package check (--skip-desktop-check)."
   else
-    read -p "  Do you want to disable third-party repositories? [y/N] " -n 1 -r
-    echo
-    DISABLE_PPA="${REPLY}"
-  fi
-
-  if [[ "${DISABLE_PPA}" =~ ^[Yy]$ ]]; then
-    if [ "${DRY_RUN}" != "true" ]; then
-      if grep_active_ppas -q; then
-        grep_active_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
-      fi
-      if grep_active_deb822_ppas -q; then
-        grep_active_deb822_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
-      fi
-      fancy_message info "Disabled active third-party repositories."
+    META="$(
+      dpkg-query -Wf '${Status}\t${Package}\n' \
+        {{,k,l,x}ubuntu,ubuntu{-budgie,-mate,kylin,studio,unity,-cinnamon}}-desktop ubuntu-wsl \
+        2>/dev/null |
+      awk -F '\t' '($1 == "install ok installed") { print $2; exit; }')"
+    if [ -n "${META}" ]; then
+      fancy_message info "Detected ${META}."
     else
-      fancy_message info "[DRY RUN] Would disable active third-party repositories."
+      fancy_message error "No installed desktop packages were detected. Use --skip-desktop-check if running on Server/Minimal."
+      exit 1
     fi
   fi
-else
-  fancy_message info "No third-party PPAs detected, this is good."
 fi
-
-fancy_message info "All pre-flight checks passed."
 
 HOST_ARCH="$(uname --machine)"
 if [ "${HOST_ARCH}" == "x86_64" ]; then
@@ -194,27 +420,60 @@ fi
 
 if [ "${DRY_RUN}" = "true" ]; then
   fancy_message info "[DRY RUN] Mode active. No modifications will be made."
-  if [ -f "${DEB822_FILE}" ]; then
-    fancy_message info "[DRY RUN] Detected modern deb822 format."
-    fancy_message info "[DRY RUN] Would update: ${DEB822_FILE}"
-    fancy_message info "[DRY RUN] Target suites: devel, devel-updates, devel-backports, devel-security"
-  else
-    fancy_message info "[DRY RUN] Detected traditional format."
-    fancy_message info "[DRY RUN] Would update: ${TRADITIONAL_FILE}"
+  if [ "${TRACK_DEVEL}" = "true" ]; then
+    if [ -f "${DEB822_FILE}" ]; then
+      fancy_message info "[DRY RUN] Would update deb822 file: ${DEB822_FILE}"
+    else
+      fancy_message info "[DRY RUN] Would update traditional file: ${TRADITIONAL_FILE}"
+    fi
+    fancy_message info "[DRY RUN] Would execute: apt dist-upgrade (tracking devel)"
   fi
-  fancy_message info "[DRY RUN] Architecture: ${HOST_ARCH}"
-  fancy_message info "[DRY RUN] Would execute: apt autoclean, clean, update, dist-upgrade, autoremove"
+  if [ "${PURGE_SNAP}" = "true" ]; then
+    fancy_message info "[DRY RUN] Would purge all Snap packages, remove snapd, and pin /etc/apt/preferences.d/nosnap.pref"
+  fi
+  if [ "${INSTALL_FLATPAK}" = "true" ]; then
+    fancy_message info "[DRY RUN] Would install Flatpak and configure Flathub"
+  fi
+  if [ "${DISABLE_PPAS}" = "true" ]; then
+    fancy_message info "[DRY RUN] Would comment out third-party PPAs and repositories"
+  fi
+  if [ "${INSTALL_DEV_TOOLS}" = "true" ]; then
+    fancy_message info "[DRY RUN] Would install Dev Essentials (curl, git, build-essential, zsh, htop)"
+  fi
+  if [ "${CLEAN_SYSTEM}" = "true" ]; then
+    fancy_message info "[DRY RUN] Would run apt autoclean, clean, and autoremove"
+  fi
   exit 0
 fi
 
-if [ "${ASSUME_YES}" = "true" ]; then
-  REPLY="y"
-else
-  read -p "Are you sure you want to start tracking the devel series? [y/N] " -n 1 -r
+# Confirmation prompt if not already assumed yes
+if [ "${ASSUME_YES}" != "true" ]; then
+  read -p "Are you sure you want to proceed with the selected tasks? [y/N] " -n 1 -r
   echo
+  if [[ ! "${REPLY}" =~ ^[Yy]$ ]]; then
+    fancy_message warn "Operation cancelled by user."
+    exit 0
+  fi
 fi
 
-if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+# 1. Disable PPAs if selected
+if [ "${DISABLE_PPAS}" = "true" ]; then
+  if grep_active_ppas -q; then
+    grep_active_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
+  fi
+  if grep_active_deb822_ppas -q; then
+    grep_active_deb822_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
+  fi
+  fancy_message info "Disabled third-party PPAs and repositories."
+fi
+
+# 2. Purge Snap if selected
+if [ "${PURGE_SNAP}" = "true" ]; then
+  purge_snap_packages
+fi
+
+# 3. Track Devel series if selected
+if [ "${TRACK_DEVEL}" = "true" ]; then
   if [ -f "${DEB822_FILE}" ]; then
     fancy_message info "Configuring deb822 sources (${DEB822_FILE})."
     cp "${DEB822_FILE}" "${DEB822_FILE}.${OS_CODENAME}.bak"
@@ -250,60 +509,44 @@ EOF
       cp "${TRADITIONAL_FILE}" "${TRADITIONAL_FILE}.${OS_CODENAME}.bak"
     fi
     cat << EOF > "${TRADITIONAL_FILE}"
-# See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to
-# newer versions of the distribution.
 deb ${ARCHIVE} devel main restricted
-# deb-src ${ARCHIVE} devel main restricted
-
-## Major bug fix updates produced after the final release of the
-## distribution.
 deb ${ARCHIVE} devel-updates main restricted
-# deb-src ${ARCHIVE} devel-updates main restricted
-
-## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
-## team. Also, please note that software in universe WILL NOT receive any
-## review or updates from the Ubuntu security team.
 deb ${ARCHIVE} devel universe
-# deb-src ${ARCHIVE} devel universe
 deb ${ARCHIVE} devel-updates universe
-# deb-src ${ARCHIVE} devel-updates universe
-
-## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
-## team, and may not be under a free licence. Please satisfy yourself as to
-## your rights to use the software. Also, please note that software in
-## multiverse WILL NOT receive any review or updates from the Ubuntu
-## security team.
 deb ${ARCHIVE} devel multiverse
-# deb-src ${ARCHIVE} devel multiverse
 deb ${ARCHIVE} devel-updates multiverse
-# deb-src ${ARCHIVE} devel-updates multiverse
-
-## N.B. software from this repository may not have been tested as
-## extensively as that contained in the main release, although it includes
-## newer versions of some applications which may provide useful features.
-## Also, please note that software in backports WILL NOT receive any review
-## or updates from the Ubuntu security team.
 deb ${ARCHIVE} devel-backports main restricted universe multiverse
-# deb-src ${ARCHIVE} devel-backports main restricted universe multiverse
-
 deb ${SEC_ARCHIVE} devel-security main restricted
-# deb-src ${SEC_ARCHIVE} devel-security main restricted
 deb ${SEC_ARCHIVE} devel-security universe
-# deb-src ${SEC_ARCHIVE} devel-security universe
 deb ${SEC_ARCHIVE} devel-security multiverse
-# deb-src ${SEC_ARCHIVE} devel-security multiverse
 EOF
   fi
 
-  fancy_message info "Switching to devel series."
-  apt -y autoclean
-  apt -y clean
-  apt -y update
-  apt -y dist-upgrade
-  apt -y autoremove
-  fancy_message info "Your Rolling Rebirth is ready."
+  fancy_message info "Switching to devel series and running dist-upgrade..."
+  apt-get -y update
+  apt-get -y dist-upgrade
+fi
 
-  if [ -f "$(dirname "$0")/logo.txt" ]; then
-    cat "$(dirname "$0")/logo.txt"
-  fi
+# 4. Install Flatpak if selected
+if [ "${INSTALL_FLATPAK}" = "true" ]; then
+  install_flatpak_support
+fi
+
+# 5. Install Dev Essentials if selected
+if [ "${INSTALL_DEV_TOOLS}" = "true" ]; then
+  install_dev_tools
+fi
+
+# 6. System Cleanup if selected
+if [ "${CLEAN_SYSTEM}" = "true" ]; then
+  fancy_message info "Cleaning up system caches and unused packages..."
+  apt-get -y autoclean
+  apt-get -y clean
+  apt-get -y autoremove
+fi
+
+fancy_message info "Your Rolling Rebirth is ready."
+
+if [ -f "$(dirname "$0")/logo.txt" ]; then
+  cat "$(dirname "$0")/logo.txt"
 fi
