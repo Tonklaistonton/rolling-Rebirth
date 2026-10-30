@@ -33,7 +33,7 @@ function grep_active_ppas ()
   grep "$@" -e '^\s*deb\s' -R --include='*.list' /etc/apt/sources.list.d
 }
 
-echo "Rolling Rhino 🦏"
+echo "Rolling Rebirth 🔄"
 
 # Take command line arguments
 while [ $# -gt 0 ]; do
@@ -179,7 +179,7 @@ EOF
     apt -y update
     apt -y dist-upgrade
     apt -y autoremove
-    fancy_message info "Your Rolling Rhino is ready."
+    fancy_message info "Your Rolling Rebirth is ready."
 
     cat "$(dirname "$0")/logo.txt"
 fi

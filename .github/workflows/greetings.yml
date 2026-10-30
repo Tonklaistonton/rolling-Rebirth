@@ -10,20 +10,11 @@ jobs:
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
         issue-message: |
-          'Hello there!
-          You seem to have filed your first issue for the `rolling-rhino` project. Great!
-          
-          It doesn't matter if you are just starting out and dip your feet into the GitHub water for the first time
-          or if you are you are an experienced programmer/Linux enthusiast - we are a welcoming, friendly community.
-          Consider taking a look at Wimpy's [YouTube Channel](https://www.youtube.com/channel/UChpYmMp7EFaxuogUX1eAqyw)
-          or [Discord](https://discord.gg/sNmz3uw), if you fancy chatting with us nerds 🤓
-          Hopefully your issue gets resolved soon. Bye for now!'
+          Hello there!
+          Thank you for filing an issue for the `rolling-Rebirth` project.
+          Whether you are just starting out or an experienced programmer/Linux enthusiast, welcome!
+          We will review your issue as soon as possible.
         pr-message: |
-          'Hello there!
-          You seem to have filed your first Pull Request to the `rolling-rhino` project. Great!
-          
-          It doesn't matter if you are just starting out and dip your feet into the GitHub water for the first time
-          or if you are you are an experienced programmer/Linux enthusiast - we are a welcoming, friendly community.
-          Consider taking a look at Wimpy's [YouTube Channel](https://www.youtube.com/channel/UChpYmMp7EFaxuogUX1eAqyw)
-          or [Discord](https://discord.gg/sNmz3uw), if you fancy chatting with us nerds 🤓
-          Bye for now and happy coding!'
+          Hello there!
+          Thank you for filing your first Pull Request to `rolling-Rebirth`.
+          We appreciate your contribution and will review it soon!
