@@ -85,7 +85,6 @@ Once confirmed, `rebirth` executes your chosen tasks in sequence, backs up your 
 * [x] **Modular Devel Toggle:** Ability to deselect tracking devel to use Rebirth purely as a system tweaker/de-snapper (`--no-devel`).
 * [x] **Server & Minimal Mode:** Option to run without requiring a desktop environment package installed (`--skip-desktop-check`).
 * [x] **Dry-run Mode:** Safe simulation before applying changes (`--dry-run`).
-* [ ] **Safety & Snapshot Integration:** Automatic Btrfs or Timeshift snapshot before triggering `dist-upgrade`.
 
 ---
 
