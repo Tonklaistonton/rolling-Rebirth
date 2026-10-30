@@ -2,17 +2,27 @@
 
 function usage () {
   echo
-  echo "Usage"
-  echo "  $0"
+  echo "Rolling Rebirth 🔄"
+  echo "Convert Ubuntu into a rolling release tracking the devel series."
+  echo
+  echo "Usage:"
+  echo "  sudo $0 [OPTIONS]"
+  echo
+  echo "Options:"
+  echo "  -f, --force               Force tracking devel series even on stable LTS/interim releases"
+  echo "  -s, --skip-desktop-check  Skip checking for desktop package (e.g. for Server/Minimal)"
+  echo "  -y, --yes                 Automatic yes to prompts (unattended mode)"
+  echo "  -d, --dry-run             Perform pre-flight checks and display plan without making changes"
+  echo "  -h, --help                Show this help message"
   echo
 }
 
 function fancy_message() {
     # $1 = type , $2 = message
     # Message types
-    # 0 - info
-    # 1 - warning
-    # 2 - error
+    # info
+    # warn
+    # error
     if [ -z "${1}" ] || [ -z "${2}" ]; then
       return 2
     fi
@@ -30,10 +40,18 @@ function fancy_message() {
 
 function grep_active_ppas ()
 {
-  grep "$@" -e '^\s*deb\s' -R --include='*.list' /etc/apt/sources.list.d
+  grep "$@" -e '^\s*deb\s' -R --include='*.list' --exclude='*.orig' /etc/apt/sources.list.d 2>/dev/null
 }
 
-echo "Rolling Rebirth 🔄"
+function grep_active_deb822_ppas ()
+{
+  grep "$@" -e '^\s*Suites:' -R --include='*.sources' --exclude='ubuntu.sources*' --exclude='*.orig' /etc/apt/sources.list.d 2>/dev/null
+}
+
+FORCE=false
+SKIP_DESKTOP=false
+ASSUME_YES=false
+DRY_RUN=false
 
 # Take command line arguments
 while [ $# -gt 0 ]; do
@@ -41,6 +59,18 @@ while [ $# -gt 0 ]; do
     -h|--h|-help|--help)
       usage
       exit 0;;
+    -f|--force)
+      FORCE=true
+      shift;;
+    -s|--skip-desktop-check)
+      SKIP_DESKTOP=true
+      shift;;
+    -y|--yes)
+      ASSUME_YES=true
+      shift;;
+    -d|--dry-run)
+      DRY_RUN=true
+      shift;;
     *)
       fancy_message error "\"${1}\" is not a supported parameter."
       usage
@@ -48,80 +78,178 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+echo "Rolling Rebirth 🔄"
+
 # Check if the user running the script is root
-if [ "$(id -u)" -ne 0 ]; then
-  fancy_message error "You need to be root."
+if [ "${DRY_RUN}" != "true" ] && [ "$(id -u)" -ne 0 ]; then
+  fancy_message error "You need to be root. Run with sudo: sudo $0"
   exit 1
 fi
 
-if which lsb_release 1>/dev/null; then
+if which lsb_release 1>/dev/null 2>&1; then
   fancy_message info "lsb_release detected."
 else
   fancy_message error "lsb_release not detected. Quitting."
   exit 1
 fi
 
-if grep -q devel /etc/apt/sources.list; then
+DEB822_FILE="/etc/apt/sources.list.d/ubuntu.sources"
+TRADITIONAL_FILE="/etc/apt/sources.list"
+
+already_tracking=false
+if [ -f "${DEB822_FILE}" ] && grep -E -q '^\s*Suites:.*\bdevel\b' "${DEB822_FILE}"; then
+  already_tracking=true
+fi
+if [ -f "${TRADITIONAL_FILE}" ] && grep -E -q '^\s*deb\s+.*\bdevel\b' "${TRADITIONAL_FILE}"; then
+  already_tracking=true
+fi
+
+if [ "${already_tracking}" = "true" ]; then
   fancy_message error "Already tracking the devel series. Nothing to do."
   exit 1
 fi
 
-OS_CODENAME=$(lsb_release --codename --short)
-OS_ID=$(lsb_release --id --short)
+OS_CODENAME=$(lsb_release --codename --short 2>/dev/null)
+OS_ID=$(lsb_release --id --short 2>/dev/null)
 if [ "${OS_ID}" == "Ubuntu" ]; then
-  fancy_message info "Ubuntu detected."
+  fancy_message info "Ubuntu detected (${OS_CODENAME})."
 else
-  fancy_message error "${OS_ID} detected, which is not supported."
+  fancy_message error "${OS_ID:-Unknown OS} detected, which is not supported."
   exit 1
 fi
 
-OS_DESCRIPTION=$(lsb_release --description --short)
+OS_DESCRIPTION=$(lsb_release --description --short 2>/dev/null)
 if [[ "${OS_DESCRIPTION}" == *"development branch"* ]]; then
   fancy_message info "${OS_DESCRIPTION} detected."
-elif  [[ "${OS_DESCRIPTION}" == *"LTS"* ]]; then
-  fancy_message error "${OS_DESCRIPTION} detected. Switching a LTS release to the devel series directly is not supported."
+elif [ "${FORCE}" = "true" ]; then
+  fancy_message warn "${OS_DESCRIPTION} detected. Forcing switch to devel series as requested (--force)."
+elif [[ "${OS_DESCRIPTION}" == *"LTS"* ]]; then
+  fancy_message error "${OS_DESCRIPTION} detected. Switching directly from a stable LTS release to devel is not recommended. Use --force to proceed anyway."
   exit 1
 else
-  fancy_message error "${OS_DESCRIPTION} detected. Switching an interim release to the devel series directly is not supported."
+  fancy_message error "${OS_DESCRIPTION} detected. Switching directly from an interim release to devel is not recommended. Use --force to proceed anyway."
   exit 1
 fi
 
-META="$(
-  dpkg-query -Wf '${Status}\t${Package}\n' \
-    {{,k,l,x}ubuntu,ubuntu{-budgie,-mate,kylin,studio}}-desktop ubuntu-wsl \
-    2>/dev/null |
-  awk -F '\t' '($1 == "install ok installed") { print $2; exit; }')"
-if [ -n "${META}" ]; then
-  fancy_message info "Detected ${META}."
+if [ "${SKIP_DESKTOP}" = "true" ]; then
+  fancy_message info "Skipping desktop package check (--skip-desktop-check)."
 else
-  fancy_message error "No installed desktop packages were detected. Quitting."
-  exit 1
+  META="$(
+    dpkg-query -Wf '${Status}\t${Package}\n' \
+      {{,k,l,x}ubuntu,ubuntu{-budgie,-mate,kylin,studio,unity,-cinnamon}}-desktop ubuntu-wsl \
+      2>/dev/null |
+    awk -F '\t' '($1 == "install ok installed") { print $2; exit; }')"
+  if [ -n "${META}" ]; then
+    fancy_message info "Detected ${META}."
+  else
+    fancy_message error "No installed desktop packages were detected. Use --skip-desktop-check if running on Server/Minimal."
+    exit 1
+  fi
 fi
 
-if grep_active_ppas -q; then
-  fancy_message warn "PPAs detected, you're responsible for taking care of PPA migrations in the future."
-  read -p "Do you want to disable the PPAs? [y/N]" -n 1 -r
-  if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
-    grep_active_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
+has_ppas=false
+if grep_active_ppas -q || grep_active_deb822_ppas -q; then
+  has_ppas=true
+fi
+
+if [ "${has_ppas}" = "true" ]; then
+  fancy_message warn "PPAs or third-party repositories detected. You are responsible for PPA migrations in the future."
+  if [ "${ASSUME_YES}" = "true" ]; then
+    DISABLE_PPA="y"
+  elif [ "${DRY_RUN}" = "true" ]; then
+    DISABLE_PPA="n"
+  else
+    read -p "  Do you want to disable third-party repositories? [y/N] " -n 1 -r
+    echo
+    DISABLE_PPA="${REPLY}"
+  fi
+
+  if [[ "${DISABLE_PPA}" =~ ^[Yy]$ ]]; then
+    if [ "${DRY_RUN}" != "true" ]; then
+      if grep_active_ppas -q; then
+        grep_active_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
+      fi
+      if grep_active_deb822_ppas -q; then
+        grep_active_deb822_ppas -lZ | xargs -r0 -- sed -i.orig -e 's/^\s*[^#\s]/# &/'
+      fi
+      fancy_message info "Disabled active third-party repositories."
+    else
+      fancy_message info "[DRY RUN] Would disable active third-party repositories."
+    fi
   fi
 else
-  fancy_message info "No PPAs detected, this is good."
+  fancy_message info "No third-party PPAs detected, this is good."
 fi
 
-fancy_message info "All checks passed."
-read -p "Are you sure you want to start tracking the devel series? [y/N]" -n 1 -r
+fancy_message info "All pre-flight checks passed."
+
+HOST_ARCH="$(uname --machine)"
+if [ "${HOST_ARCH}" == "x86_64" ]; then
+  ARCHIVE="http://archive.ubuntu.com/ubuntu"
+  SEC_ARCHIVE="http://security.ubuntu.com/ubuntu"
+else
+  ARCHIVE="http://ports.ubuntu.com/ubuntu-ports"
+  SEC_ARCHIVE="http://ports.ubuntu.com/ubuntu-ports"
+fi
+
+if [ "${DRY_RUN}" = "true" ]; then
+  fancy_message info "[DRY RUN] Mode active. No modifications will be made."
+  if [ -f "${DEB822_FILE}" ]; then
+    fancy_message info "[DRY RUN] Detected modern deb822 format."
+    fancy_message info "[DRY RUN] Would update: ${DEB822_FILE}"
+    fancy_message info "[DRY RUN] Target suites: devel, devel-updates, devel-backports, devel-security"
+  else
+    fancy_message info "[DRY RUN] Detected traditional format."
+    fancy_message info "[DRY RUN] Would update: ${TRADITIONAL_FILE}"
+  fi
+  fancy_message info "[DRY RUN] Architecture: ${HOST_ARCH}"
+  fancy_message info "[DRY RUN] Would execute: apt autoclean, clean, update, dist-upgrade, autoremove"
+  exit 0
+fi
+
+if [ "${ASSUME_YES}" = "true" ]; then
+  REPLY="y"
+else
+  read -p "Are you sure you want to start tracking the devel series? [y/N] " -n 1 -r
+  echo
+fi
 
 if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
-    HOST_ARCH="$(uname --machine)"
-    if [ "${HOST_ARCH}" == "x86_64" ]; then
-      ARCHIVE="http://archive.ubuntu.com/ubuntu"
-      SEC_ARCHIVE="http://security.ubuntu.com/ubuntu"
-    else
-      ARCHIVE="http://ports.ubuntu.com/ubuntu-ports"
-      SEC_ARCHIVE="http://ports.ubuntu.com/ubuntu-ports"
+  if [ -f "${DEB822_FILE}" ]; then
+    fancy_message info "Configuring deb822 sources (${DEB822_FILE})."
+    cp "${DEB822_FILE}" "${DEB822_FILE}.${OS_CODENAME}.bak"
+
+    SIGNED_BY=""
+    if [ -f "/usr/share/keyrings/ubuntu-archive-keyring.gpg" ]; then
+      SIGNED_BY="Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
     fi
-    cp  /etc/apt/sources.list "/etc/apt/sources.list.${OS_CODENAME}"
-    cat << EOF > /etc/apt/sources.list
+
+    cat << EOF > "${DEB822_FILE}"
+Types: deb
+URIs: ${ARCHIVE}
+Suites: devel devel-updates devel-backports
+Components: main restricted universe multiverse
+${SIGNED_BY}
+
+Types: deb
+URIs: ${SEC_ARCHIVE}
+Suites: devel-security
+Components: main restricted universe multiverse
+${SIGNED_BY}
+EOF
+
+    # Disable conflicting active deb entries in traditional sources.list if present
+    if [ -f "${TRADITIONAL_FILE}" ] && grep -E -q '^\s*deb\s' "${TRADITIONAL_FILE}"; then
+      fancy_message info "Disabling conflicting entries in ${TRADITIONAL_FILE}."
+      cp "${TRADITIONAL_FILE}" "${TRADITIONAL_FILE}.${OS_CODENAME}.bak"
+      sed -i -e 's/^\s*deb/# deb/' "${TRADITIONAL_FILE}"
+    fi
+  else
+    fancy_message info "Configuring traditional sources (${TRADITIONAL_FILE})."
+    if [ -f "${TRADITIONAL_FILE}" ]; then
+      cp "${TRADITIONAL_FILE}" "${TRADITIONAL_FILE}.${OS_CODENAME}.bak"
+    fi
+    cat << EOF > "${TRADITIONAL_FILE}"
 # See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to
 # newer versions of the distribution.
 deb ${ARCHIVE} devel main restricted
@@ -158,13 +286,6 @@ deb ${ARCHIVE} devel-updates multiverse
 deb ${ARCHIVE} devel-backports main restricted universe multiverse
 # deb-src ${ARCHIVE} devel-backports main restricted universe multiverse
 
-## Uncomment the following two lines to add software from Canonical's
-## 'partner' repository.
-## This software is not part of Ubuntu, but is offered by Canonical and the
-## respective vendors as a service to Ubuntu users.
-# deb http://archive.canonical.com/ubuntu devel partner
-# deb-src http://archive.canonical.com/ubuntu devel partner
-
 deb ${SEC_ARCHIVE} devel-security main restricted
 # deb-src ${SEC_ARCHIVE} devel-security main restricted
 deb ${SEC_ARCHIVE} devel-security universe
@@ -172,14 +293,17 @@ deb ${SEC_ARCHIVE} devel-security universe
 deb ${SEC_ARCHIVE} devel-security multiverse
 # deb-src ${SEC_ARCHIVE} devel-security multiverse
 EOF
+  fi
 
-    fancy_message info "Switching to devel series."
-    apt -y autoclean
-    apt -y clean
-    apt -y update
-    apt -y dist-upgrade
-    apt -y autoremove
-    fancy_message info "Your Rolling Rebirth is ready."
+  fancy_message info "Switching to devel series."
+  apt -y autoclean
+  apt -y clean
+  apt -y update
+  apt -y dist-upgrade
+  apt -y autoremove
+  fancy_message info "Your Rolling Rebirth is ready."
 
+  if [ -f "$(dirname "$0")/logo.txt" ]; then
     cat "$(dirname "$0")/logo.txt"
+  fi
 fi

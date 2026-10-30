@@ -37,27 +37,35 @@ cd rolling-Rebirth
 sudo ./rebirth
 ```
 
+#### Command Options:
+* `-d, --dry-run`: Test pre-flight checks and view proposed changes without modifying files.
+* `-f, --force`: Force tracking devel series even on stable LTS/interim releases.
+* `-s, --skip-desktop-check`: Skip checking for desktop packages (ideal for Server or Minimal setups).
+* `-y, --yes`: Automatic yes to prompts (unattended mode).
+* `-h, --help`: Display usage help.
+
 ### 3. Example Output
 
 ```text
 Rolling Rebirth 🔄
   [+] INFO: lsb_release detected.
-  [+] INFO: Ubuntu detected.
+  [+] INFO: Ubuntu detected (noble).
   [+] INFO: Ubuntu 24.04 LTS (development branch) detected.
   [+] INFO: Detected ubuntu-desktop.
-  [+] INFO: No PPAs detected, this is good.
-  [+] INFO: All checks passed.
-Are you sure want to start tracking the devel series? [y/N]
+  [+] INFO: No third-party PPAs detected, this is good.
+  [+] INFO: All pre-flight checks passed.
+Are you sure you want to start tracking the devel series? [y/N]
 ```
 
-Once confirmed, `rebirth` updates your APT sources to point to `devel`, cleans up obsolete caches, and performs a full `dist-upgrade`.
+Once confirmed, `rebirth` updates your APT sources (automatically detecting whether to update modern deb822 `ubuntu.sources` or traditional `sources.list`), backs up previous configs, cleans up obsolete caches, and performs a full `dist-upgrade`.
 
 ---
 
-## 🛠️ Roadmap & Future Enhancements
+## 🛠️ Roadmap & Enhancements
 
-* [ ] **Modern APT Support (deb822):** Full compatibility with `/etc/apt/sources.list.d/ubuntu.sources` on Ubuntu 24.04 Noble Numbat and newer.
-* [ ] **Server & Minimal Mode:** Option to run without requiring a desktop environment package installed (`--skip-desktop-check`).
+* [x] **Modern APT Support (deb822):** Full compatibility with `/etc/apt/sources.list.d/ubuntu.sources` on Ubuntu 24.04 Noble Numbat and newer.
+* [x] **Server & Minimal Mode:** Option to run without requiring a desktop environment package installed (`--skip-desktop-check`).
+* [x] **Dry-run Mode:** Safe simulation before applying changes (`--dry-run`).
 * [ ] **Safety & Snapshot Integration:** Automatic Btrfs or Timeshift snapshot before triggering `dist-upgrade`.
 * [ ] **Custom Packages & Dotfiles:** Easy hooks to auto-install preferred developer tools and configs.
 
