@@ -59,9 +59,7 @@ function grep_active_deb822_ppas ()
 }
 
 function backup_user_snap_data () {
-  local timestamp
-  timestamp="$(date +%Y%m%d_%H%M%S)"
-  local backed_up=false
+  local timestamp="${1}"
 
   # Check /home/* and /root for ~/snap directory
   for user_home in /home/* /root; do
@@ -73,7 +71,6 @@ function backup_user_snap_data () {
       if cp -a "${snap_dir}" "${backup_dir}"; then
         chown -R --reference="${user_home}" "${backup_dir}" 2>/dev/null || true
         fancy_message info "Backup created: ${backup_dir}"
-        backed_up=true
       else
         fancy_message error "Failed to back up ${snap_dir}! Aborting snap purge to protect user data."
         return 1
@@ -81,28 +78,23 @@ function backup_user_snap_data () {
     fi
   done
 
-  # Backup system snapshots if available
-  if [ -d /var/lib/snapd/snapshots ] && [ "$(ls -A /var/lib/snapd/snapshots 2>/dev/null)" ]; then
-    local sys_backup="/var/backups/snapd-snapshots.${timestamp}"
-    fancy_message info "Backing up system snap snapshots to ${sys_backup}..."
-    mkdir -p "/var/backups"
-    cp -a /var/lib/snapd/snapshots "${sys_backup}" 2>/dev/null || true
-  fi
-
   return 0
 }
 
 function purge_snap_packages () {
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+
   fancy_message warn "Initiating Snap purge..."
 
   # Step 1: Backup user profiles and data first!
-  if ! backup_user_snap_data; then
+  if ! backup_user_snap_data "${timestamp}"; then
     fancy_message error "Snap purge aborted due to backup failure."
     return 1
   fi
 
   # Step 2: Remove installed snap packages
-  # Note: removed without --purge so snapd creates internal backup snapshots
+  # Note: removed without --purge so snapd creates internal backup snapshots in /var/lib/snapd/snapshots/
   if command -v snap 1>/dev/null 2>&1; then
     # Phase 1: Normal desktop applications
     for s in $(snap list 2>/dev/null | awk 'NR>1 {print $1}'); do
@@ -133,20 +125,30 @@ function purge_snap_packages () {
     done
   fi
 
-  # Step 3: Stop and disable snap services
+  # Step 3: Preserve snapd-generated snapshots before stopping service and removing directories
+  if [ -d /var/lib/snapd/snapshots ] && [ -n "$(ls -A /var/lib/snapd/snapshots 2>/dev/null)" ]; then
+    local sys_backup="/var/backups/snapd-snapshots.${timestamp}"
+    fancy_message info "Preserving snapd internal snapshots -> ${sys_backup}"
+    mkdir -p "/var/backups"
+    if cp -a /var/lib/snapd/snapshots "${sys_backup}"; then
+      fancy_message info "Snapshots preserved at: ${sys_backup}"
+    fi
+  fi
+
+  # Step 4: Stop and disable snap services
   fancy_message info "Stopping snapd systemd services..."
   systemctl stop snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
   systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
 
-  # Step 4: Purge snapd Debian package via APT
+  # Step 5: Purge snapd Debian package via APT
   fancy_message info "Purging snapd Debian package..."
   if ! apt-get purge -y snapd; then
     fancy_message error "APT reported errors while purging snapd."
   fi
   apt-get autoremove --purge -y || true
 
-  # Step 5: Clean up leftover system directories and active ~/snap
-  # Note: User data has been safely preserved in ~/snap.bak.<timestamp>
+  # Step 6: Clean up leftover snap directories and active ~/snap
+  # Note: User data is preserved in ~/snap.bak.<timestamp> and snapshots in /var/backups/
   fancy_message info "Removing leftover snap directories..."
   rm -rf /var/cache/snapd /var/snap /snap /var/lib/snapd /etc/systemd/system/snap* 2>/dev/null || true
   rm -rf /root/snap 2>/dev/null || true
@@ -156,7 +158,7 @@ function purge_snap_packages () {
     fi
   done
 
-  # Step 6: Block snapd from being reinstalled (APT pinning)
+  # Step 7: Block snapd from being reinstalled (APT pinning)
   fancy_message info "Pinning APT preferences to block snapd from being reinstalled..."
   cat << 'EOF' > /etc/apt/preferences.d/nosnap.pref
 # Created by Rolling Rebirth
@@ -166,10 +168,13 @@ Pin: release *
 Pin-Priority: -10
 EOF
 
-  # Step 7: Post-purge verification
+  # Step 8: Post-purge verification
+  # Clear Bash command hash table cache so command -v does not return stale cached path
+  hash -r
+
   local verify_failed=false
-  if command -v snap 1>/dev/null 2>&1; then
-    fancy_message error "Verification failed: 'snap' binary is still present at $(command -v snap)"
+  if [ -x /usr/bin/snap ] || [ -f /usr/bin/snap ] || [ -x /snap/bin/snap ] || command -v snap 1>/dev/null 2>&1; then
+    fancy_message error "Verification failed: 'snap' binary is still present on the system."
     verify_failed=true
   fi
   if dpkg-query -W -f='${Status}' snapd 2>/dev/null | grep -q "install ok installed"; then
@@ -200,6 +205,7 @@ function install_flatpak_support () {
     apt-get install -y gnome-software-plugin-flatpak || fancy_message warn "Could not install gnome-software-plugin-flatpak."
   fi
 
+  hash -r
   if ! command -v flatpak 1>/dev/null 2>&1; then
     fancy_message error "Verification failed: 'flatpak' command not found after installation."
     return 1
