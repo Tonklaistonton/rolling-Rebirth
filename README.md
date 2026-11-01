@@ -40,43 +40,50 @@ sudo ./rebirth
 #### Command Options:
 * `-m, --menu`: Force interactive checklist menu (runs automatically when launched in terminal).
 * `--no-menu`: Skip interactive menu and use CLI flags or default settings.
-* `-p, --purge-snap`: Purge all snap packages, remove snapd, and block snapd via APT pinning.
-* `--no-purge-snap`: Keep snapd and snap packages.
+* `-t, --track-devel`: Switch repositories to Ubuntu 'devel' series and dist-upgrade.
+* `--no-devel`: Do NOT switch to devel series (run only selected tweaks).
+* `-p, --purge-snap`: Purge all snap packages, remove snapd, and block snapd via APT pinning (backs up `~/snap` first).
+* `--no-purge-snap`: Explicitly keep snapd and snap packages.
 * `--flatpak`: Install Flatpak and configure Flathub repository (recommended alternative).
 * `--dev-tools`: Install developer essentials (curl, git, build-essential, zsh, htop).
-* `--no-devel`: Do NOT switch to devel series (run only selected tweaks like Snap removal).
+* `--disable-ppas`: Disable active third-party PPAs and repositories.
+* `--cleanup`: Clean up system caches and unused packages (`autoclean`/`autoremove`).
 * `-d, --dry-run`: Test pre-flight checks and view proposed changes without modifying files.
 * `-f, --force`: Force tracking devel series even on stable LTS/interim releases.
 * `-s, --skip-desktop-check`: Skip checking for desktop packages (ideal for Server or Minimal setups).
-* `-y, --yes`: Automatic yes to prompts (unattended mode, skips interactive menu).
+* `-y, --yes`: Automatic yes to prompts (unattended mode, requires explicit task flags).
 * `-h, --help`: Display usage help.
 
 ### 3. Interactive Menu Interface
 
-When you run `sudo ./rebirth`, you get an interactive checklist menu. Use your keyboard to customize exactly what you want:
+When you run `sudo ./rebirth`, you get a safe, non-destructive interactive checklist. All tasks start unchecked by default so you have full control over what runs:
 
 ```text
   ==[ Configuration Checklist ]==
   Use [↑/↓] or [j/k] to navigate, [Space] to toggle, [Enter] to confirm:
 
-  ➔ [✔] Track Ubuntu 'devel' series (Rolling Release)
-    [✔] Purge Snap completely and block snapd (De-Snap)
+  ➔ [ ] Track Ubuntu 'devel' series (Rolling Release)
+    [ ] Purge Snap completely and block snapd (De-Snap)
     [ ] Install Flatpak with Flathub repository
     [ ] Disable active third-party PPAs & external repositories
     [ ] Install Dev Essentials (curl, git, build-essential, zsh, htop)
-    [✔] Clean up obsolete packages & APT cache
+    [ ] Clean up obsolete packages & APT cache
 ```
 
 * Navigate with **`↑` / `↓`** (or **`k` / `j`**)
 * Toggle selections on/off with **`[Space]`**
 * Press **`[Enter]`** to confirm and run!
 
-Once confirmed, `rebirth` executes your chosen tasks in sequence, backs up your configurations, updates sources (supporting modern deb822 `ubuntu.sources`), and sets up your system cleanly.
+> [!NOTE]
+> If Snap purge is selected, your user profiles, bookmarks, and saved data in `~/snap` are automatically backed up to `~/snap.bak.<timestamp>` before any packages are removed.
 
 ---
 
 ## 🛠️ Roadmap & Enhancements
 
+* [x] **Safe Opt-in Defaults:** Nothing is modified unless explicitly selected in the menu or specified via CLI flags.
+* [x] **Automatic User Data Backup:** Protects browser/app profiles in `~/snap` before De-Snap.
+* [x] **Rigorous Error Checking & Verification:** Real exit code verification and post-action checks (no silent swallowing of errors).
 * [x] **Interactive Spacebar Checklist Menu:** Navigate with arrows and toggle choices with Spacebar before execution.
 * [x] **Modern APT Support (deb822):** Full compatibility with `/etc/apt/sources.list.d/ubuntu.sources` on Ubuntu 24.04 Noble Numbat and newer.
 * [x] **Complete Snap Purge (De-Snap):** Fully remove snap packages, services, directories, and block snapd from reinstalling (`-p, --purge-snap`).

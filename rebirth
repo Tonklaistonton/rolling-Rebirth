@@ -11,11 +11,17 @@ function usage () {
   echo "Options:"
   echo "  -m, --menu                Force interactive checklist menu (default in terminal)"
   echo "      --no-menu             Skip interactive menu and use command line flags"
+  echo "  -t, --track-devel         Switch Ubuntu repositories to 'devel' series and dist-upgrade"
+  echo "      --no-devel            Explicitly do not switch repositories to devel series"
   echo "  -p, --purge-snap          Purge all snap packages, remove snapd, and pin APT against snapd"
-  echo "      --no-purge-snap       Keep snapd and snap packages"
+  echo "      --no-purge-snap       Explicitly keep snapd and snap packages"
   echo "      --flatpak             Install Flatpak and configure Flathub repository"
+  echo "      --no-flatpak          Explicitly do not install Flatpak"
   echo "      --dev-tools           Install developer essentials (curl, git, build-essential, zsh, htop)"
-  echo "      --no-devel            Do not switch to devel series (run only selected tweaks/snap purge)"
+  echo "      --no-dev-tools        Explicitly do not install developer essentials"
+  echo "      --disable-ppas        Disable active third-party PPAs and repositories"
+  echo "      --cleanup             Clean up system caches and unused packages (autoclean/autoremove)"
+  echo "      --no-cleanup          Explicitly skip system cleanup"
   echo "  -f, --force               Force tracking devel series even on stable LTS/interim releases"
   echo "  -s, --skip-desktop-check  Skip checking for desktop package (e.g. for Server/Minimal)"
   echo "  -y, --yes                 Automatic yes to all prompts (unattended mode, skips menu)"
@@ -52,17 +58,59 @@ function grep_active_deb822_ppas ()
   grep "$@" -e '^\s*Suites:' -R --include='*.sources' --exclude='ubuntu.sources*' --exclude='*.orig' /etc/apt/sources.list.d 2>/dev/null
 }
 
-function purge_snap_packages () {
-  fancy_message info "Purging all Snap packages and snapd..."
+function backup_user_snap_data () {
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  local backed_up=false
 
-  if which snap 1>/dev/null 2>&1; then
+  # Check /home/* and /root for ~/snap directory
+  for user_home in /home/* /root; do
+    [ -d "${user_home}" ] || continue
+    local snap_dir="${user_home}/snap"
+    if [ -d "${snap_dir}" ]; then
+      local backup_dir="${user_home}/snap.bak.${timestamp}"
+      fancy_message warn "Backing up user application data: ${snap_dir} -> ${backup_dir}"
+      if cp -a "${snap_dir}" "${backup_dir}"; then
+        chown -R --reference="${user_home}" "${backup_dir}" 2>/dev/null || true
+        fancy_message info "Backup created: ${backup_dir}"
+        backed_up=true
+      else
+        fancy_message error "Failed to back up ${snap_dir}! Aborting snap purge to protect user data."
+        return 1
+      fi
+    fi
+  done
+
+  # Backup system snapshots if available
+  if [ -d /var/lib/snapd/snapshots ] && [ "$(ls -A /var/lib/snapd/snapshots 2>/dev/null)" ]; then
+    local sys_backup="/var/backups/snapd-snapshots.${timestamp}"
+    fancy_message info "Backing up system snap snapshots to ${sys_backup}..."
+    mkdir -p "/var/backups"
+    cp -a /var/lib/snapd/snapshots "${sys_backup}" 2>/dev/null || true
+  fi
+
+  return 0
+}
+
+function purge_snap_packages () {
+  fancy_message warn "Initiating Snap purge..."
+
+  # Step 1: Backup user profiles and data first!
+  if ! backup_user_snap_data; then
+    fancy_message error "Snap purge aborted due to backup failure."
+    return 1
+  fi
+
+  # Step 2: Remove installed snap packages
+  # Note: removed without --purge so snapd creates internal backup snapshots
+  if command -v snap 1>/dev/null 2>&1; then
     # Phase 1: Normal desktop applications
     for s in $(snap list 2>/dev/null | awk 'NR>1 {print $1}'); do
       case "${s}" in
         core*|bare|snapd|base*|gtk-common-themes*|gnome-*) ;;
         *)
-          fancy_message info "Removing snap app: ${s}"
-          snap remove --purge "${s}" 2>/dev/null || true
+          fancy_message info "Removing snap application: ${s}"
+          snap remove "${s}" || fancy_message warn "snap remove reported an issue for: ${s}"
           ;;
       esac
     done
@@ -73,7 +121,7 @@ function purge_snap_packages () {
         core*|bare|snapd) ;;
         *)
           fancy_message info "Removing snap runtime: ${s}"
-          snap remove --purge "${s}" 2>/dev/null || true
+          snap remove "${s}" || fancy_message warn "snap remove reported an issue for: ${s}"
           ;;
       esac
     done
@@ -81,30 +129,34 @@ function purge_snap_packages () {
     # Phase 3: Core runtimes and snapd
     for s in $(snap list 2>/dev/null | awk 'NR>1 {print $1}'); do
       fancy_message info "Removing core snap: ${s}"
-      snap remove --purge "${s}" 2>/dev/null || true
+      snap remove "${s}" || fancy_message warn "snap remove reported an issue for: ${s}"
     done
   fi
 
-  # Stop and disable snap services
-  fancy_message info "Stopping snapd services..."
+  # Step 3: Stop and disable snap services
+  fancy_message info "Stopping snapd systemd services..."
   systemctl stop snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
   systemctl disable snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
 
-  # Purge snapd package via apt
+  # Step 4: Purge snapd Debian package via APT
   fancy_message info "Purging snapd Debian package..."
-  apt-get purge -y snapd 2>/dev/null || true
-  apt-get autoremove --purge -y 2>/dev/null || true
+  if ! apt-get purge -y snapd; then
+    fancy_message error "APT reported errors while purging snapd."
+  fi
+  apt-get autoremove --purge -y || true
 
-  # Remove snap directories
-  fancy_message info "Cleaning up leftover snap directories..."
-  rm -rf /var/cache/snapd /var/snap /snap /var/lib/snapd /root/snap /etc/systemd/system/snap* 2>/dev/null || true
+  # Step 5: Clean up leftover system directories and active ~/snap
+  # Note: User data has been safely preserved in ~/snap.bak.<timestamp>
+  fancy_message info "Removing leftover snap directories..."
+  rm -rf /var/cache/snapd /var/snap /snap /var/lib/snapd /etc/systemd/system/snap* 2>/dev/null || true
+  rm -rf /root/snap 2>/dev/null || true
   for user_home in /home/*; do
     if [ -d "${user_home}/snap" ]; then
       rm -rf "${user_home}/snap" 2>/dev/null || true
     fi
   done
 
-  # Block snapd from being reinstalled (APT pinning)
+  # Step 6: Block snapd from being reinstalled (APT pinning)
   fancy_message info "Pinning APT preferences to block snapd from being reinstalled..."
   cat << 'EOF' > /etc/apt/preferences.d/nosnap.pref
 # Created by Rolling Rebirth
@@ -114,28 +166,64 @@ Pin: release *
 Pin-Priority: -10
 EOF
 
-  fancy_message info "Snap has been completely purged and blocked."
+  # Step 7: Post-purge verification
+  local verify_failed=false
+  if command -v snap 1>/dev/null 2>&1; then
+    fancy_message error "Verification failed: 'snap' binary is still present at $(command -v snap)"
+    verify_failed=true
+  fi
+  if dpkg-query -W -f='${Status}' snapd 2>/dev/null | grep -q "install ok installed"; then
+    fancy_message error "Verification failed: snapd package is still marked as installed."
+    verify_failed=true
+  fi
+
+  if [ "${verify_failed}" = "true" ]; then
+    fancy_message error "Snap purge was incomplete. Please review errors above."
+    return 1
+  else
+    fancy_message info "Verification passed: Snap has been completely purged and blocked."
+    return 0
+  fi
 }
 
 function install_flatpak_support () {
   fancy_message info "Installing Flatpak..."
-  apt-get update 2>/dev/null || true
-  apt-get install -y flatpak 2>/dev/null || true
+  if ! apt-get update; then
+    fancy_message warn "apt-get update reported issues; attempting to continue with Flatpak installation..."
+  fi
+  if ! apt-get install -y flatpak; then
+    fancy_message error "Failed to install flatpak package via APT."
+    return 1
+  fi
 
   if dpkg -s gnome-software 1>/dev/null 2>&1; then
-    apt-get install -y gnome-software-plugin-flatpak 2>/dev/null || true
+    apt-get install -y gnome-software-plugin-flatpak || fancy_message warn "Could not install gnome-software-plugin-flatpak."
+  fi
+
+  if ! command -v flatpak 1>/dev/null 2>&1; then
+    fancy_message error "Verification failed: 'flatpak' command not found after installation."
+    return 1
   fi
 
   fancy_message info "Adding Flathub repository..."
-  flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
-  fancy_message info "Flatpak and Flathub installed successfully."
+  if ! flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo; then
+    fancy_message error "Failed to add Flathub repository."
+    return 1
+  fi
+
+  fancy_message info "Verification passed: Flatpak and Flathub installed successfully."
+  return 0
 }
 
 function install_dev_tools () {
   fancy_message info "Installing Dev Essentials (curl, git, build-essential, zsh, htop)..."
-  apt-get update 2>/dev/null || true
-  apt-get install -y curl git build-essential zsh htop 2>/dev/null || true
-  fancy_message info "Dev Essentials installed successfully."
+  apt-get update || fancy_message warn "apt-get update reported issues."
+  if ! apt-get install -y curl git build-essential zsh htop; then
+    fancy_message error "Failed to install some Dev Essentials packages."
+    return 1
+  fi
+  fancy_message info "Verification passed: Dev Essentials installed successfully."
+  return 0
 }
 
 function interactive_checklist () {
@@ -148,16 +236,16 @@ function interactive_checklist () {
     "Clean up obsolete packages & APT cache"
   )
 
-  # Default selection: Devel (1), De-Snap (1), Cleanup (1)
-  local -a selected=(1 1 0 0 0 1)
+  # Safe default: All unchecked (0) so user chooses explicitly
+  local -a selected=(0 0 0 0 0 0)
 
-  # Respect CLI overrides if provided
+  # Respect explicit CLI overrides if provided
+  [ "${TRACK_DEVEL_CLI}" = "true" ] && selected[0]=1
   [ "${PURGE_SNAP_CLI}" = "true" ] && selected[1]=1
-  [ "${PURGE_SNAP_CLI}" = "false" ] && selected[1]=0
   [ "${INSTALL_FLATPAK_CLI}" = "true" ] && selected[2]=1
-  [ "${INSTALL_FLATPAK_CLI}" = "false" ] && selected[2]=0
+  [ "${DISABLE_PPAS_CLI}" = "true" ] && selected[3]=1
   [ "${DEV_TOOLS_CLI}" = "true" ] && selected[4]=1
-  [ "${TRACK_DEVEL_CLI}" = "false" ] && selected[0]=0
+  [ "${CLEAN_SYSTEM_CLI}" = "true" ] && selected[5]=1
 
   local cur=0
   local total=${#options[@]}
@@ -251,12 +339,35 @@ function interactive_checklist () {
   [ "${selected[5]}" -eq 1 ] && CLEAN_SYSTEM=true || CLEAN_SYSTEM=false
 
   fancy_message info "Confirmed selections:"
-  [ "${TRACK_DEVEL}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Track Ubuntu 'devel' series"
-  [ "${PURGE_SNAP}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Purge Snap completely and block snapd"
-  [ "${INSTALL_FLATPAK}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Install Flatpak & configure Flathub"
-  [ "${DISABLE_PPAS}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Disable third-party PPAs"
-  [ "${INSTALL_DEV_TOOLS}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Install Dev Essentials"
-  [ "${CLEAN_SYSTEM}" = "true" ] && echo -e "    \033[1;32m✔\033[0m Full system cleanup"
+  local any_selected=false
+  if [ "${TRACK_DEVEL}" = "true" ]; then
+    echo -e "    \033[1;32m✔\033[0m Track Ubuntu 'devel' series"
+    any_selected=true
+  fi
+  if [ "${PURGE_SNAP}" = "true" ]; then
+    echo -e "    \033[1;32m✔\033[0m Purge Snap completely and block snapd"
+    any_selected=true
+  fi
+  if [ "${INSTALL_FLATPAK}" = "true" ]; then
+    echo -e "    \033[1;32m✔\033[0m Install Flatpak & configure Flathub"
+    any_selected=true
+  fi
+  if [ "${DISABLE_PPAS}" = "true" ]; then
+    echo -e "    \033[1;32m✔\033[0m Disable third-party PPAs"
+    any_selected=true
+  fi
+  if [ "${INSTALL_DEV_TOOLS}" = "true" ]; then
+    echo -e "    \033[1;32m✔\033[0m Install Dev Essentials"
+    any_selected=true
+  fi
+  if [ "${CLEAN_SYSTEM}" = "true" ]; then
+    echo -e "    \033[1;32m✔\033[0m Full system cleanup"
+    any_selected=true
+  fi
+
+  if [ "${any_selected}" = "false" ]; then
+    echo -e "    (No tasks selected)"
+  fi
   echo
 }
 
@@ -270,6 +381,8 @@ PURGE_SNAP_CLI=""
 INSTALL_FLATPAK_CLI=""
 DEV_TOOLS_CLI=""
 TRACK_DEVEL_CLI=""
+DISABLE_PPAS_CLI=""
+CLEAN_SYSTEM_CLI=""
 
 # Take command line arguments
 while [ $# -gt 0 ]; do
@@ -283,6 +396,12 @@ while [ $# -gt 0 ]; do
     --no-menu)
       NO_MENU=true
       shift;;
+    -t|--track-devel)
+      TRACK_DEVEL_CLI=true
+      shift;;
+    --no-devel)
+      TRACK_DEVEL_CLI=false
+      shift;;
     -p|--purge-snap)
       PURGE_SNAP_CLI=true
       shift;;
@@ -292,11 +411,23 @@ while [ $# -gt 0 ]; do
     --flatpak|--install-flatpak)
       INSTALL_FLATPAK_CLI=true
       shift;;
+    --no-flatpak)
+      INSTALL_FLATPAK_CLI=false
+      shift;;
     --dev-tools)
       DEV_TOOLS_CLI=true
       shift;;
-    --no-devel)
-      TRACK_DEVEL_CLI=false
+    --no-dev-tools)
+      DEV_TOOLS_CLI=false
+      shift;;
+    --disable-ppas)
+      DISABLE_PPAS_CLI=true
+      shift;;
+    --cleanup)
+      CLEAN_SYSTEM_CLI=true
+      shift;;
+    --no-cleanup)
+      CLEAN_SYSTEM_CLI=false
       shift;;
     -f|--force)
       FORCE=true
@@ -357,12 +488,22 @@ fi
 if [ "${SHOW_INTERACTIVE}" = "true" ]; then
   interactive_checklist
 else
-  TRACK_DEVEL=${TRACK_DEVEL_CLI:-true}
-  PURGE_SNAP=${PURGE_SNAP_CLI:-true}
+  # Non-interactive / unattended mode defaults:
+  # Everything is FALSE by default to prevent accidental destructive actions
+  TRACK_DEVEL=${TRACK_DEVEL_CLI:-false}
+  PURGE_SNAP=${PURGE_SNAP_CLI:-false}
   INSTALL_FLATPAK=${INSTALL_FLATPAK_CLI:-false}
+  DISABLE_PPAS=${DISABLE_PPAS_CLI:-false}
   INSTALL_DEV_TOOLS=${DEV_TOOLS_CLI:-false}
-  DISABLE_PPAS=false
-  CLEAN_SYSTEM=true
+  CLEAN_SYSTEM=${CLEAN_SYSTEM_CLI:-false}
+fi
+
+# If no tasks were chosen at all, exit safely
+if [ "${TRACK_DEVEL}" != "true" ] && [ "${PURGE_SNAP}" != "true" ] && \
+   [ "${INSTALL_FLATPAK}" != "true" ] && [ "${DISABLE_PPAS}" != "true" ] && \
+   [ "${INSTALL_DEV_TOOLS}" != "true" ] && [ "${CLEAN_SYSTEM}" != "true" ]; then
+  fancy_message warn "No tasks were selected. Run interactively or specify flags (e.g. -t, -p, --flatpak)."
+  exit 0
 fi
 
 # Pre-flight check for Track Devel if selected
@@ -376,7 +517,7 @@ if [ "${TRACK_DEVEL}" = "true" ]; then
   fi
 
   if [ "${already_tracking}" = "true" ]; then
-    fancy_message warn "Already tracking the devel series. Skipping source modification."
+    fancy_message warn "Already tracking the devel series. Skipping repository modification."
     TRACK_DEVEL=false
   fi
 
@@ -429,6 +570,7 @@ if [ "${DRY_RUN}" = "true" ]; then
     fancy_message info "[DRY RUN] Would execute: apt dist-upgrade (tracking devel)"
   fi
   if [ "${PURGE_SNAP}" = "true" ]; then
+    fancy_message info "[DRY RUN] Would back up ~/snap directories to ~/snap.bak.<timestamp>"
     fancy_message info "[DRY RUN] Would purge all Snap packages, remove snapd, and pin /etc/apt/preferences.d/nosnap.pref"
   fi
   if [ "${INSTALL_FLATPAK}" = "true" ]; then
@@ -446,8 +588,11 @@ if [ "${DRY_RUN}" = "true" ]; then
   exit 0
 fi
 
-# Confirmation prompt if not already assumed yes
+# Confirmation prompt if not unattended
 if [ "${ASSUME_YES}" != "true" ]; then
+  if [ "${PURGE_SNAP}" = "true" ]; then
+    fancy_message warn "NOTE: Selected tasks include purging Snap. User application profiles in ~/snap will be backed up to ~/snap.bak.<timestamp>."
+  fi
   read -p "Are you sure you want to proceed with the selected tasks? [y/N] " -n 1 -r
   echo
   if [[ ! "${REPLY}" =~ ^[Yy]$ ]]; then
@@ -455,6 +600,9 @@ if [ "${ASSUME_YES}" != "true" ]; then
     exit 0
   fi
 fi
+
+# Variable to track overall success
+EXECUTION_ERROR=false
 
 # 1. Disable PPAs if selected
 if [ "${DISABLE_PPAS}" = "true" ]; then
@@ -469,7 +617,9 @@ fi
 
 # 2. Purge Snap if selected
 if [ "${PURGE_SNAP}" = "true" ]; then
-  purge_snap_packages
+  if ! purge_snap_packages; then
+    EXECUTION_ERROR=true
+  fi
 fi
 
 # 3. Track Devel series if selected
@@ -522,31 +672,48 @@ deb ${SEC_ARCHIVE} devel-security multiverse
 EOF
   fi
 
-  fancy_message info "Switching to devel series and running dist-upgrade..."
-  apt-get -y update
-  apt-get -y dist-upgrade
+  fancy_message info "Updating package lists for devel series..."
+  if ! apt-get -y update; then
+    fancy_message error "apt-get update failed on devel repositories."
+    EXECUTION_ERROR=true
+  fi
+
+  fancy_message info "Running dist-upgrade to track devel series..."
+  if ! apt-get -y dist-upgrade; then
+    fancy_message error "apt-get dist-upgrade encountered errors."
+    EXECUTION_ERROR=true
+  fi
 fi
 
 # 4. Install Flatpak if selected
 if [ "${INSTALL_FLATPAK}" = "true" ]; then
-  install_flatpak_support
+  if ! install_flatpak_support; then
+    EXECUTION_ERROR=true
+  fi
 fi
 
 # 5. Install Dev Essentials if selected
 if [ "${INSTALL_DEV_TOOLS}" = "true" ]; then
-  install_dev_tools
+  if ! install_dev_tools; then
+    EXECUTION_ERROR=true
+  fi
 fi
 
 # 6. System Cleanup if selected
 if [ "${CLEAN_SYSTEM}" = "true" ]; then
   fancy_message info "Cleaning up system caches and unused packages..."
-  apt-get -y autoclean
-  apt-get -y clean
-  apt-get -y autoremove
+  apt-get -y autoclean || true
+  apt-get -y clean || true
+  apt-get -y autoremove || true
 fi
 
-fancy_message info "Your Rolling Rebirth is ready."
-
-if [ -f "$(dirname "$0")/logo.txt" ]; then
-  cat "$(dirname "$0")/logo.txt"
+# Final status report
+if [ "${EXECUTION_ERROR}" = "true" ]; then
+  fancy_message error "Rolling Rebirth finished with errors. Please review the output above."
+  exit 1
+else
+  fancy_message info "Your Rolling Rebirth is ready."
+  if [ -f "$(dirname "$0")/logo.txt" ]; then
+    cat "$(dirname "$0")/logo.txt"
+  fi
 fi
