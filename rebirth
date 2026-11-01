@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 function usage () {
   echo
@@ -33,7 +34,7 @@ function usage () {
 function fancy_message() {
     # $1 = type , $2 = message
     # Message types: info, warn, error
-    if [ -z "${1}" ] || [ -z "${2}" ]; then
+    if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
       return 2
     fi
 
@@ -58,10 +59,11 @@ function grep_active_deb822_ppas ()
   grep "$@" -e '^\s*Suites:' -R --include='*.sources' --exclude='ubuntu.sources*' --exclude='*.orig' /etc/apt/sources.list.d 2>/dev/null
 }
 
+LAST_SNAP_BACKUP=""
+
 function backup_user_snap_data () {
   local timestamp="${1}"
 
-  # Check /home/* and /root for ~/snap directory
   for user_home in /home/* /root; do
     [ -d "${user_home}" ] || continue
     local snap_dir="${user_home}/snap"
@@ -71,6 +73,7 @@ function backup_user_snap_data () {
       if cp -a "${snap_dir}" "${backup_dir}"; then
         chown -R --reference="${user_home}" "${backup_dir}" 2>/dev/null || true
         fancy_message info "Backup created: ${backup_dir}"
+        LAST_SNAP_BACKUP="${backup_dir}"
       else
         fancy_message error "Failed to back up ${snap_dir}! Aborting snap purge to protect user data."
         return 1
@@ -132,6 +135,8 @@ function purge_snap_packages () {
     mkdir -p "/var/backups"
     if cp -a /var/lib/snapd/snapshots "${sys_backup}"; then
       fancy_message info "Snapshots preserved at: ${sys_backup}"
+    else
+      fancy_message warn "Could not back up snapd internal snapshots from /var/lib/snapd/snapshots to ${sys_backup}."
     fi
   fi
 
@@ -144,6 +149,7 @@ function purge_snap_packages () {
   fancy_message info "Purging snapd Debian package..."
   if ! apt-get purge -y snapd; then
     fancy_message error "APT reported errors while purging snapd."
+    return 1
   fi
   apt-get autoremove --purge -y || true
 
@@ -228,8 +234,58 @@ function install_dev_tools () {
     fancy_message error "Failed to install some Dev Essentials packages."
     return 1
   fi
+  hash -r
   fancy_message info "Verification passed: Dev Essentials installed successfully."
   return 0
+}
+
+function update_deb822_sources() {
+  local target_file="${1}"
+  local backup_file="${1}.${OS_CODENAME}.bak"
+
+  cp "${target_file}" "${backup_file}"
+
+  # Use awk to update Suites in-place while strictly preserving all existing URIs, Components, Signed-By, and comments
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk '
+    /^[[:space:]]*Suites:.*-security/ { print "Suites: devel-security"; next }
+    /^[[:space:]]*Suites:/ { print "Suites: devel devel-updates devel-backports"; next }
+    { print }
+  ' "${target_file}" > "${tmp_file}"
+  mv "${tmp_file}" "${target_file}"
+  chmod 644 "${target_file}"
+}
+
+function write_default_deb822_sources() {
+  local target_file="${1}"
+  local signed_by=""
+  if [ -f "/usr/share/keyrings/ubuntu-archive-keyring.gpg" ]; then
+    signed_by="Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
+  fi
+
+  cat << EOF > "${target_file}"
+Types: deb
+URIs: ${ARCHIVE}
+Suites: devel devel-updates devel-backports
+Components: main restricted universe multiverse
+${signed_by}
+
+Types: deb
+URIs: ${SEC_ARCHIVE}
+Suites: devel-security
+Components: main restricted universe multiverse
+${signed_by}
+EOF
+}
+
+function update_traditional_sources() {
+  local target_file="${1}"
+  local backup_file="${1}.${OS_CODENAME}.bak"
+
+  cp "${target_file}" "${backup_file}"
+  # Update existing lines in place, replacing codename with devel while preserving existing mirrors
+  sed -i -E 's/^([[:space:]]*deb[[:space:]]+[^[:space:]]+[[:space:]]+)[a-zA-Z0-9_-]+(-updates|-backports|-security)?/\1devel\2/' "${target_file}"
 }
 
 function interactive_checklist () {
@@ -246,12 +302,12 @@ function interactive_checklist () {
   local -a selected=(0 0 0 0 0 0)
 
   # Respect explicit CLI overrides if provided
-  [ "${TRACK_DEVEL_CLI}" = "true" ] && selected[0]=1
-  [ "${PURGE_SNAP_CLI}" = "true" ] && selected[1]=1
-  [ "${INSTALL_FLATPAK_CLI}" = "true" ] && selected[2]=1
-  [ "${DISABLE_PPAS_CLI}" = "true" ] && selected[3]=1
-  [ "${DEV_TOOLS_CLI}" = "true" ] && selected[4]=1
-  [ "${CLEAN_SYSTEM_CLI}" = "true" ] && selected[5]=1
+  [ "${TRACK_DEVEL_CLI:-}" = "true" ] && selected[0]=1 || true
+  [ "${PURGE_SNAP_CLI:-}" = "true" ] && selected[1]=1 || true
+  [ "${INSTALL_FLATPAK_CLI:-}" = "true" ] && selected[2]=1 || true
+  [ "${DISABLE_PPAS_CLI:-}" = "true" ] && selected[3]=1 || true
+  [ "${DEV_TOOLS_CLI:-}" = "true" ] && selected[4]=1 || true
+  [ "${CLEAN_SYSTEM_CLI:-}" = "true" ] && selected[5]=1 || true
 
   local cur=0
   local total=${#options[@]}
@@ -260,14 +316,21 @@ function interactive_checklist () {
   UP="${ESC}[A"
   DOWN="${ESC}[B"
 
-  # Hide cursor and ensure cleanup on exit
+  # Hide cursor and ensure cleanup on exit / interrupt
   printf "\033[?25l"
-  stty_state=$(stty -g 2>/dev/null)
+  stty_state="$(stty -g 2>/dev/null || true)"
   restore_cursor() {
     printf "\033[?25h"
-    [ -n "${stty_state}" ] && stty "${stty_state}" 2>/dev/null
+    [ -n "${stty_state:-}" ] && stty "${stty_state}" 2>/dev/null || true
   }
-  trap restore_cursor EXIT INT TERM
+  handle_sigint() {
+    restore_cursor
+    echo
+    fancy_message warn "Operation aborted by user."
+    exit 130
+  }
+  trap handle_sigint INT TERM
+  trap restore_cursor EXIT
 
   print_menu() {
     for i in "${!options[@]}"; do
@@ -295,10 +358,12 @@ function interactive_checklist () {
   print_menu
 
   while true; do
-    IFS= read -rsn1 key
+    local key=""
+    IFS= read -rsn1 key || true
     if [ "$key" = "$ESC" ]; then
-      read -rsn2 -t 0.5 rest
-      key+="$rest"
+      local rest=""
+      read -rsn2 -t 0.5 rest || true
+      key+="${rest:-}"
     fi
 
     case "$key" in
@@ -333,7 +398,8 @@ function interactive_checklist () {
   done
 
   restore_cursor
-  trap - EXIT INT TERM
+  trap - INT TERM
+  trap - EXIT
   echo
 
   # Assign results
@@ -462,7 +528,7 @@ if [ "${DRY_RUN}" != "true" ] && [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if which lsb_release 1>/dev/null 2>&1; then
+if command -v lsb_release 1>/dev/null 2>&1; then
   fancy_message info "lsb_release detected."
 else
   fancy_message error "lsb_release not detected. Quitting."
@@ -472,8 +538,8 @@ fi
 DEB822_FILE="/etc/apt/sources.list.d/ubuntu.sources"
 TRADITIONAL_FILE="/etc/apt/sources.list"
 
-OS_CODENAME=$(lsb_release --codename --short 2>/dev/null)
-OS_ID=$(lsb_release --id --short 2>/dev/null)
+OS_CODENAME="$(lsb_release --codename --short 2>/dev/null || true)"
+OS_ID="$(lsb_release --id --short 2>/dev/null || true)"
 if [ "${OS_ID}" == "Ubuntu" ]; then
   fancy_message info "Ubuntu detected (${OS_CODENAME})."
 else
@@ -481,7 +547,7 @@ else
   exit 1
 fi
 
-OS_DESCRIPTION=$(lsb_release --description --short 2>/dev/null)
+OS_DESCRIPTION="$(lsb_release --description --short 2>/dev/null || true)"
 
 # Decide whether to show interactive checklist
 SHOW_INTERACTIVE=false
@@ -523,22 +589,23 @@ if [ "${TRACK_DEVEL}" = "true" ]; then
   fi
 
   if [ "${already_tracking}" = "true" ]; then
-    fancy_message warn "Already tracking the devel series. Skipping repository modification."
-    TRACK_DEVEL=false
-  fi
-
-  if [[ "${OS_DESCRIPTION}" == *"development branch"* ]]; then
-    fancy_message info "${OS_DESCRIPTION} detected."
-  elif [ "${FORCE}" = "true" ]; then
-    fancy_message warn "${OS_DESCRIPTION} detected. Forcing switch to devel series as requested (--force)."
-  elif [[ "${OS_DESCRIPTION}" == *"LTS"* ]]; then
-    fancy_message error "${OS_DESCRIPTION} detected. Switching directly from a stable LTS release to devel is not recommended. Use --force to proceed anyway."
-    exit 1
+    fancy_message info "Already tracking the devel series. Repository configuration is already set to devel."
   else
-    fancy_message error "${OS_DESCRIPTION} detected. Switching directly from an interim release to devel is not recommended. Use --force to proceed anyway."
-    exit 1
+    # Only enforce LTS/interim warning if not already on devel
+    if [[ "${OS_DESCRIPTION}" == *"development branch"* ]]; then
+      fancy_message info "${OS_DESCRIPTION} detected."
+    elif [ "${FORCE}" = "true" ]; then
+      fancy_message warn "${OS_DESCRIPTION} detected. Forcing switch to devel series as requested (--force)."
+    elif [[ "${OS_DESCRIPTION}" == *"LTS"* ]]; then
+      fancy_message error "${OS_DESCRIPTION} detected. Switching directly from a stable LTS release to devel is not recommended. Use --force to proceed anyway."
+      exit 1
+    else
+      fancy_message error "${OS_DESCRIPTION} detected. Switching directly from an interim release to devel is not recommended. Use --force to proceed anyway."
+      exit 1
+    fi
   fi
 
+  # Check desktop package if requested
   if [ "${SKIP_DESKTOP}" = "true" ]; then
     fancy_message info "Skipping desktop package check (--skip-desktop-check)."
   else
@@ -546,12 +613,22 @@ if [ "${TRACK_DEVEL}" = "true" ]; then
       dpkg-query -Wf '${Status}\t${Package}\n' \
         {{,k,l,x}ubuntu,ubuntu{-budgie,-mate,kylin,studio,unity,-cinnamon}}-desktop ubuntu-wsl \
         2>/dev/null |
-      awk -F '\t' '($1 == "install ok installed") { print $2; exit; }')"
+      awk -F '\t' '($1 == "install ok installed") { print $2; exit; }' || true
+    )"
     if [ -n "${META}" ]; then
       fancy_message info "Detected ${META}."
     else
       fancy_message error "No installed desktop packages were detected. Use --skip-desktop-check if running on Server/Minimal."
       exit 1
+    fi
+  fi
+
+  # Warn about PPAs when switching to devel
+  if grep_active_ppas -q || grep_active_deb822_ppas -q; then
+    fancy_message warn "Active third-party PPAs or repositories were detected!"
+    fancy_message warn "Most PPAs do not publish packages for the 'devel' series and will cause 404/dependency errors."
+    if [ "${DISABLE_PPAS}" != "true" ]; then
+      fancy_message warn "Consider enabling 'Disable active third-party PPAs' (--disable-ppas) to avoid repository conflicts."
     fi
   fi
 fi
@@ -569,11 +646,11 @@ if [ "${DRY_RUN}" = "true" ]; then
   fancy_message info "[DRY RUN] Mode active. No modifications will be made."
   if [ "${TRACK_DEVEL}" = "true" ]; then
     if [ -f "${DEB822_FILE}" ]; then
-      fancy_message info "[DRY RUN] Would update deb822 file: ${DEB822_FILE}"
+      fancy_message info "[DRY RUN] Would update deb822 file: ${DEB822_FILE} (preserving existing mirror URIs)"
     else
-      fancy_message info "[DRY RUN] Would update traditional file: ${TRADITIONAL_FILE}"
+      fancy_message info "[DRY RUN] Would update traditional file: ${TRADITIONAL_FILE} (preserving existing mirror URIs)"
     fi
-    fancy_message info "[DRY RUN] Would execute: apt dist-upgrade (tracking devel)"
+    fancy_message info "[DRY RUN] Would simulate and execute: apt dist-upgrade (tracking devel)"
   fi
   if [ "${PURGE_SNAP}" = "true" ]; then
     fancy_message info "[DRY RUN] Would back up ~/snap directories to ~/snap.bak.<timestamp>"
@@ -607,7 +684,7 @@ if [ "${ASSUME_YES}" != "true" ]; then
   fi
 fi
 
-# Variable to track overall success
+# Variable to track non-fatal errors
 EXECUTION_ERROR=false
 
 # 1. Disable PPAs if selected
@@ -622,36 +699,19 @@ if [ "${DISABLE_PPAS}" = "true" ]; then
 fi
 
 # 2. Purge Snap if selected
+# Note: If snap purge fails, abort immediately to prevent running dist-upgrade in an unstable state
 if [ "${PURGE_SNAP}" = "true" ]; then
   if ! purge_snap_packages; then
-    EXECUTION_ERROR=true
+    fancy_message error "Snap purge failed! Aborting remaining tasks to prevent system inconsistency."
+    exit 1
   fi
 fi
 
 # 3. Track Devel series if selected
 if [ "${TRACK_DEVEL}" = "true" ]; then
-  if [ -f "${DEB822_FILE}" ]; then
-    fancy_message info "Configuring deb822 sources (${DEB822_FILE})."
-    cp "${DEB822_FILE}" "${DEB822_FILE}.${OS_CODENAME}.bak"
-
-    SIGNED_BY=""
-    if [ -f "/usr/share/keyrings/ubuntu-archive-keyring.gpg" ]; then
-      SIGNED_BY="Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
-    fi
-
-    cat << EOF > "${DEB822_FILE}"
-Types: deb
-URIs: ${ARCHIVE}
-Suites: devel devel-updates devel-backports
-Components: main restricted universe multiverse
-${SIGNED_BY}
-
-Types: deb
-URIs: ${SEC_ARCHIVE}
-Suites: devel-security
-Components: main restricted universe multiverse
-${SIGNED_BY}
-EOF
+  if [ -f "${DEB822_FILE}" ] && [ -s "${DEB822_FILE}" ]; then
+    fancy_message info "Updating deb822 sources (${DEB822_FILE}) while preserving configured mirrors..."
+    update_deb822_sources "${DEB822_FILE}"
 
     # Disable conflicting active deb entries in traditional sources.list if present
     if [ -f "${TRADITIONAL_FILE}" ] && grep -E -q '^\s*deb\s' "${TRADITIONAL_FILE}"; then
@@ -659,35 +719,40 @@ EOF
       cp "${TRADITIONAL_FILE}" "${TRADITIONAL_FILE}.${OS_CODENAME}.bak"
       sed -i -e 's/^\s*deb/# deb/' "${TRADITIONAL_FILE}"
     fi
-  else
-    fancy_message info "Configuring traditional sources (${TRADITIONAL_FILE})."
-    if [ -f "${TRADITIONAL_FILE}" ]; then
+  elif [ -d "/etc/apt/sources.list.d" ]; then
+    fancy_message info "Configuring deb822 sources (${DEB822_FILE})..."
+    write_default_deb822_sources "${DEB822_FILE}"
+
+    if [ -f "${TRADITIONAL_FILE}" ] && grep -E -q '^\s*deb\s' "${TRADITIONAL_FILE}"; then
+      fancy_message info "Disabling conflicting entries in ${TRADITIONAL_FILE}."
       cp "${TRADITIONAL_FILE}" "${TRADITIONAL_FILE}.${OS_CODENAME}.bak"
+      sed -i -e 's/^\s*deb/# deb/' "${TRADITIONAL_FILE}"
     fi
-    cat << EOF > "${TRADITIONAL_FILE}"
-deb ${ARCHIVE} devel main restricted
-deb ${ARCHIVE} devel-updates main restricted
-deb ${ARCHIVE} devel universe
-deb ${ARCHIVE} devel-updates universe
-deb ${ARCHIVE} devel multiverse
-deb ${ARCHIVE} devel-updates multiverse
-deb ${ARCHIVE} devel-backports main restricted universe multiverse
-deb ${SEC_ARCHIVE} devel-security main restricted
-deb ${SEC_ARCHIVE} devel-security universe
-deb ${SEC_ARCHIVE} devel-security multiverse
-EOF
+  else
+    fancy_message info "Configuring traditional sources (${TRADITIONAL_FILE}) while preserving configured mirrors..."
+    if [ -f "${TRADITIONAL_FILE}" ]; then
+      update_traditional_sources "${TRADITIONAL_FILE}"
+    fi
   fi
 
   fancy_message info "Updating package lists for devel series..."
   if ! apt-get -y update; then
-    fancy_message error "apt-get update failed on devel repositories."
-    EXECUTION_ERROR=true
+    fancy_message error "apt-get update failed on devel repositories. Aborting dist-upgrade to protect your system."
+    exit 1
   fi
 
-  fancy_message info "Running dist-upgrade to track devel series..."
+  # Simulate dist-upgrade first before applying changes!
+  fancy_message info "Simulating dist-upgrade (dry-run check)..."
+  if ! apt-get -s dist-upgrade >/dev/null 2>&1; then
+    fancy_message error "Simulation failed: 'apt-get -s dist-upgrade' detected package conflicts or broken dependencies."
+    fancy_message error "Aborting dist-upgrade to protect your system from becoming unbootable."
+    exit 1
+  fi
+
+  fancy_message info "Simulation passed. Performing actual dist-upgrade to devel series..."
   if ! apt-get -y dist-upgrade; then
     fancy_message error "apt-get dist-upgrade encountered errors."
-    EXECUTION_ERROR=true
+    exit 1
   fi
 fi
 
@@ -715,11 +780,39 @@ fi
 
 # Final status report
 if [ "${EXECUTION_ERROR}" = "true" ]; then
-  fancy_message error "Rolling Rebirth finished with errors. Please review the output above."
+  fancy_message error "Rolling Rebirth finished with warnings/errors. Please review the output above."
   exit 1
 else
   fancy_message info "Your Rolling Rebirth is ready."
   if [ -f "$(dirname "$0")/logo.txt" ]; then
     cat "$(dirname "$0")/logo.txt"
   fi
+fi
+
+# Browser and Profile Restoration Guide
+if [ "${PURGE_SNAP}" = "true" ]; then
+  echo
+  printf "  \033[1;33m==[\033[0m \033[1;37mNotice: Browser & Profile Restoration Guide\033[0m \033[1;33m]==\033[0m\n"
+  echo "  Ubuntu's default Firefox was installed via Snap and has been removed."
+  if [ -n "${LAST_SNAP_BACKUP}" ]; then
+    echo "  Your bookmarks, passwords, and user profile data were safely backed up to:"
+    echo -e "    \033[1;36m${LAST_SNAP_BACKUP}\033[0m"
+  else
+    echo "  Your bookmarks, passwords, and user profile data are preserved in your ~/snap.bak.* directory."
+  fi
+  echo
+  echo "  To restore a web browser:"
+  echo "  1) Option A: Install Firefox via Flatpak (Sandboxed & easy updates):"
+  echo "     $ flatpak install flathub org.mozilla.firefox"
+  echo "     To restore your profile data to Flatpak Firefox:"
+  echo "     $ mkdir -p ~/.var/app/org.mozilla.firefox/.mozilla"
+  echo "     $ cp -a ~/snap.bak.*/firefox/common/.mozilla/firefox ~/.var/app/org.mozilla.firefox/.mozilla/"
+  echo
+  echo "  2) Option B: Install native Firefox (.deb) via Official Mozilla PPA:"
+  echo "     $ sudo add-apt-repository ppa:mozillateam/ppa"
+  echo "     $ sudo apt update && sudo apt install -y firefox"
+  echo "     To restore your profile data to native Firefox:"
+  echo "     $ mkdir -p ~/.mozilla"
+  echo "     $ cp -a ~/snap.bak.*/firefox/common/.mozilla/firefox ~/.mozilla/"
+  echo
 fi
